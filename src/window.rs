@@ -1284,7 +1284,19 @@ impl AppWindow {
                 }
             }
         };
+        // Panes a tab block draws: one view can't be drawn in two places.
+        let tab_shown = self.shows_tab().then(|| self.model.active_tab()).flatten();
         for n in self.chrome.visible_blocks() {
+            // A terminal block showing a tab's terminal draws that pane's view (attached
+            // while its tab is open), not a second one that re-downloads its history
+            // whenever the block comes back. Not while the pane is itself on screen.
+            if let Some(addr) = n.terminal()
+                && let Some(pane) = self.block_pane(&n.id, addr)
+                && !tab_shown.is_some_and(|t| t.root.find(&pane).is_some())
+            {
+                terms.push((pane, addr.to_owned()));
+                continue;
+            }
             visit(n, &mut terms, &mut mods);
             // An agent block with an agent outside every tab gets its own view.
             if matches!(n.content(), Some(Content::Agent { .. }))
@@ -1764,9 +1776,22 @@ impl AppWindow {
         dialog.or(shown).unwrap_or_else(|| self.focus.clone()).focus(window, cx);
     }
 
-    /// The terminal view a pane shows: the swapped-in one, else its own.
+    /// The terminal view a pane shows: the swapped-in one, else its own. A layout
+    /// block showing a tab's terminal shows that pane's view (see `visible`).
     fn pane_term(&self, pane: &str) -> Option<&Term> {
-        self.swapped.get(pane).and_then(|_| self.terms.get(&format!("{pane}{SWAP}"))).or_else(|| self.terms.get(pane))
+        self.swapped.get(pane).and_then(|_| self.terms.get(&format!("{pane}{SWAP}"))).or_else(|| self.terms.get(pane)).or_else(|| {
+            let addr = terminal_block(&self.chrome, Some(pane))?.terminal()?;
+            self.terms.get(&self.block_pane(pane, addr)?)
+        })
+    }
+
+    /// The tab pane whose view a layout terminal block reuses: the pane showing
+    /// the same terminal, when the block isn't that pane.
+    fn block_pane(&self, block: &str, addr: &str) -> Option<String> {
+        if addr.is_empty() || self.model.tab_of(block).is_some() {
+            return None;
+        }
+        self.model.pane_of(addr).filter(|p| p != block)
     }
 
     /// Key path for `terminal.copy`. Copies and clears when there is a selection.
@@ -2588,6 +2613,16 @@ impl AppWindow {
                 return self.sync(window, cx);
             }
             if closed && self.model.address_of(block).as_deref() == Some(t.address.as_str()) {
+                // Layout blocks drawing this pane's view (see `visible`) go too, as
+                // the end of a view of their own would have taken them.
+                let address = t.address.clone();
+                let reusing: Vec<String> = self.chrome.visible_blocks().into_iter()
+                    .filter(|n| n.terminal() == Some(address.as_str()) && self.block_pane(&n.id, &address).as_deref() == Some(block))
+                    .map(|n| n.id.clone())
+                    .collect();
+                for id in reusing {
+                    self.chrome.remove_slot(&id);
+                }
                 self.model.remove_pane(block);
                 return self.sync(window, cx);
             }
@@ -7384,6 +7419,67 @@ export default class Probe extends View {
     #[test]
     fn focused_selection_follows_the_terminal_receiving_commands() {
         in_own_process("selection_view_focus");
+    }
+
+    #[test]
+    fn terminal_blocks_reuse_their_tab_panes_view() {
+        in_own_process("terminal_block_view_reuse");
+    }
+
+    #[gpui::test]
+    fn terminal_block_view_reuse(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("terminal_block_view_reuse") {
+            return;
+        }
+        let blocks = |terminals: &[(&str, &str)], tab: bool| {
+            let mut children: Vec<_> = terminals.iter().map(|(id, t)| json!({"id": id, "type": "block", "content": {"terminal": t}})).collect();
+            if tab {
+                children.push(json!({"id": "main", "type": "block", "content": {"tab": "active"}}));
+            }
+            serde_json::from_value::<crate::layout::Node>(json!({"id": "root", "type": "row", "children": children})).unwrap()
+        };
+        let (view, cx) = open_window(cx, "reuse-probe", "import { View, div } from \"gpui-kit\";\nexport default class P extends View { render() { return div(); } }\n", json!({
+            "id": "root", "type": "row", "children": [{"id": "strip-a", "type": "block", "content": {"terminal": "t1"}}]
+        }));
+        let entity = |this: &super::AppWindow, slot: &str| this.pane_term(slot).map(|t| t.view.entity_id());
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.model.add_space("s1", "one", "", crate::model::Tab::new("a", "a", "pa", "t1"));
+            for address in ["t1", "t9"] {
+                this.live.insert(address.into(), json!({"address": address}));
+            }
+            this.chrome = blocks(&[("strip-a", "t1"), ("loose", "t9")], false);
+            this.sync(window, cx);
+            assert!(!this.terms.contains_key("strip-a"), "no second view of a tab's terminal");
+            assert_eq!(entity(this, "strip-a"), entity(this, "pa"), "the block draws the pane's view");
+            assert_eq!(this.terms["loose"].address, "t9", "a terminal in no tab keeps its own view");
+        }));
+        let first = cx.update(|_, cx| view.read(cx).terms["pa"].view.entity_id());
+        // The block leaves (another tab selected) and comes back: same view, no new attach.
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.chrome = blocks(&[("loose", "t9")], false);
+            this.sync(window, cx);
+            this.chrome = blocks(&[("strip-a", "t1")], false);
+            this.sync(window, cx);
+            assert_eq!(entity(this, "strip-a"), Some(first), "kept attached while away");
+        }));
+        // With the pane itself on screen, the block draws its own view: one view, one place.
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.chrome = blocks(&[("strip-a", "t1")], true);
+            this.sync(window, cx);
+            assert_eq!(this.terms.get("strip-a").map(|t| t.address.as_str()), Some("t1"));
+            assert_eq!(entity(this, "pa"), Some(first));
+        }));
+        // Its program exits: the pane closes, and so does the block drawing its view.
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.chrome = blocks(&[("strip-a", "t1"), ("loose", "t9")], false);
+            this.sync(window, cx);
+            this.terms["pa"].view.update(cx, |v, _| v.ended = Some("exited".into()));
+            this.terminal_ended("pa", window, cx);
+            assert!(this.model.pane_of("t1").is_none(), "the pane closed");
+            assert!(this.chrome.find("strip-a").is_none(), "the block went with it");
+            assert!(this.chrome.find("loose").is_some(), "other blocks stay");
+        }));
     }
 
     #[gpui::test]
